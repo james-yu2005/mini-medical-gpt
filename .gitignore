@@ -1,1 +1,10 @@
-gpt_venv
+gpt_venv/
+.vscode/
+__pycache__/
+build/
+*.pyd
+
+# generated data & caches (recreate with data/load_dataset.py and python -m tokenizer.train)
+data/input.txt
+tokenizer/bpe.json
+tokenizer/corpus_tokens.pt
