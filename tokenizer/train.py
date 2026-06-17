@@ -28,13 +28,7 @@ def train_tokenizer() -> BPETokenizer:
     encoded = tokenizer.encode(sample)
     print(f"Vocabulary size: {tokenizer.vocab_size}  (256 bytes + {len(tokenizer.merges)} merges)")
     print(f"Saved to:        {TOKENIZER_PATH}")
-    print()
-    print("Round-trip sample:")
-    print(f"  Original: {sample[:80]!r}...")
-    print(f"  Tokens:   {len(encoded)} subwords")
-    print(f"  Decoded:  {tokenizer.decode(encoded)[:80]!r}...")
-    print()
-    print("First 20 token pieces:", [tokenizer.token_to_str(i) for i in encoded[:20]])
+
     return tokenizer
 
 
