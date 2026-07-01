@@ -61,6 +61,24 @@ def estimate_loss():
     model.train()
     return out
 
+class RotaryEmbedding(nn.Module):
+    def __init__(self, dim, max_seq_len=block_size, base=10000):
+        super().__init__()
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        t = torch.arange(max_seq_len).float()
+        freqs = torch.outer(t, inv_freq)
+        emb = torch.cat([freqs, freqs], dim=-1)
+        self.register_buffer("cos", emb.cos())
+        self.register_buffer("sin", emb.sin())
+
+    def forward(self, x, offset=0):
+        T = x.size(1)
+        cos = self.cos[offset : offset + T].unsqueeze(0)
+        sin = self.sin[offset : offset + T].unsqueeze(0)
+        x_even, x_odd = x[..., ::2], x[..., 1::2]
+        rot = torch.stack([-x_odd, x_even], dim=-1).flatten(-2)
+        return x * cos + rot * sin
+
 class Head(nn.Module):
     """ one head of self-attention """
 
@@ -70,24 +88,16 @@ class Head(nn.Module):
         self.query = nn.Linear(n_embd, head_size, bias=False)
         self.value = nn.Linear(n_embd, head_size, bias=False)
         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
-
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x):
-        # input of size (batch, time-step, channels)
-        # output of size (batch, time-step, head size)
-        B,T,C = x.shape
-        k = self.key(x)   # (B,T,hs)
-        q = self.query(x) # (B,T,hs)
-        # compute attention scores ("affinities")
-        wei = q @ k.transpose(-2,-1) * k.shape[-1]**-0.5 # (B, T, hs) @ (B, hs, T) -> (B, T, T)
-        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf')) # (B, T, T)
-        wei = F.softmax(wei, dim=-1) # (B, T, T)
-        wei = self.dropout(wei)
-        # perform the weighted aggregation of the values
-        v = self.value(x) # (B,T,hs)
-        out = wei @ v # (B, T, T) @ (B, T, hs) -> (B, T, hs)
-        return out
+    def forward(self, x, rope):
+        B, T, C = x.shape
+        q = rope(self.query(x))
+        k = rope(self.key(x))
+        wei = q @ k.transpose(-2, -1) * k.shape[-1]**-0.5
+        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
+        wei = self.dropout(F.softmax(wei, dim=-1))
+        return wei @ self.value(x)
 
 class MultiHeadAttention(nn.Module):
     """ multiple heads of self-attention in parallel """
@@ -98,10 +108,9 @@ class MultiHeadAttention(nn.Module):
         self.proj = nn.Linear(head_size * num_heads, n_embd)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x):
-        out = torch.cat([h(x) for h in self.heads], dim=-1)
-        out = self.dropout(self.proj(out))
-        return out
+    def forward(self, x, rope):
+        out = torch.cat([h(x, rope) for h in self.heads], dim=-1)
+        return self.dropout(self.proj(out))
 
 class FeedFoward(nn.Module):
     """ a simple linear layer followed by a non-linearity """
@@ -130,8 +139,8 @@ class Block(nn.Module):
         self.ln1 = nn.LayerNorm(n_embd)
         self.ln2 = nn.LayerNorm(n_embd)
 
-    def forward(self, x):
-        x = x + self.sa(self.ln1(x))
+    def forward(self, x, rope):
+        x = x + self.sa(self.ln1(x), rope)
         x = x + self.ffwd(self.ln2(x))
         return x
 
@@ -140,8 +149,8 @@ class GPTLanguageModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
-        self.position_embedding_table = nn.Embedding(block_size, n_embd)
-        self.blocks = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
+        self.rope = RotaryEmbedding(n_embd // n_head)
+        self.blocks = nn.ModuleList([Block(n_embd, n_head) for _ in range(n_layer)])
         self.ln_f = nn.LayerNorm(n_embd) # final layer norm
         self.lm_head = nn.Linear(n_embd, vocab_size)
 
@@ -160,10 +169,9 @@ class GPTLanguageModel(nn.Module):
         B, T = idx.shape
 
         # idx and targets are both (B,T) tensor of integers
-        tok_emb = self.token_embedding_table(idx) # (B,T,C)
-        pos_emb = self.position_embedding_table(torch.arange(T, device=device)) # (T,C)
-        x = tok_emb + pos_emb # (B,T,C)
-        x = self.blocks(x) # (B,T,C)
+        x = self.token_embedding_table(idx) # (B,T,C)
+        for block in self.blocks:
+            x = block(x, self.rope)
         x = self.ln_f(x) # (B,T,C)
         logits = self.lm_head(x) # (B,T,vocab_size)
 
